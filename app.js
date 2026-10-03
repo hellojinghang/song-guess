@@ -29,6 +29,10 @@
 
   function now() { return Date.now() }
 
+  function normalizePlayerName(value) {
+    return String(value || '').normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase()
+  }
+
   function htmlEscape(value) {
     return String(value ?? '')
       .replaceAll('&', '&amp;')
@@ -122,7 +126,7 @@
     return JSON.parse(new TextDecoder().decode(plaintext))
   }
 
-  async function sendRelaySubmission(relay, payload) {
+  async function sendRelayMessage(relay, payload) {
     if (!relay?.topic || !relay?.key) throw new Error('Direct submission is unavailable for this invitation.')
     const encrypted = await encryptRelayPayload(relay.key, payload)
     const response = await fetch(`https://ntfy.sh/${encodeURIComponent(relay.topic)}`, {
@@ -131,6 +135,54 @@
       headers: { 'Cache': 'no', 'Firebase': 'no' }
     })
     if (!response.ok) throw new Error(`Relay returned HTTP ${response.status}.`)
+  }
+
+  function relayRequest(relay, payload, expectedKind, timeoutMs = 8000) {
+    return new Promise((resolve, reject) => {
+      if (!relay?.topic || !relay?.key) return reject(new Error('Direct submission is unavailable for this invitation.'))
+      const requestId = randomSecret(12)
+      const source = new EventSource(`https://ntfy.sh/${encodeURIComponent(relay.topic)}/sse`)
+      let sent = false
+      const cleanup = () => {
+        clearTimeout(timer)
+        try { source.close() } catch (_) {}
+      }
+      const timer = setTimeout(() => {
+        cleanup()
+        reject(new Error('The host did not respond. Make sure the host lobby is open, then try again.'))
+      }, timeoutMs)
+      source.onopen = async () => {
+        if (sent) return
+        sent = true
+        try {
+          await sendRelayMessage(relay, { ...payload, requestId })
+        } catch (e) {
+          cleanup()
+          reject(e)
+        }
+      }
+      source.onmessage = async (event) => {
+        try {
+          const envelope = JSON.parse(event.data)
+          if (envelope.event !== 'message' || !envelope.message) return
+          const message = await decryptRelayPayload(relay.key, envelope.message)
+          if (message?.kind !== expectedKind || message?.requestId !== requestId) return
+          cleanup()
+          resolve(message)
+        } catch (_) {}
+      }
+      source.onerror = () => {
+        // EventSource reconnects automatically; the timeout above remains the final guard.
+      }
+    })
+  }
+
+  async function requestRoomStatus(relay) {
+    return relayRequest(relay, { kind: 'status_request' }, 'status', 6000)
+  }
+
+  async function sendRelaySubmission(relay, submission) {
+    return relayRequest(relay, { kind: 'submission', submission }, 'ack', 10000)
   }
 
   function stopRelayListener() {
@@ -158,10 +210,56 @@
           const envelope = JSON.parse(event.data)
           if (envelope.event !== 'message' || !envelope.message) return
           const payload = await decryptRelayPayload(relay.key, envelope.message)
-          const changed = importPlayer(game, payload, { relay: true })
-          if (changed) {
-            toast(`${payload.name} submitted`)
-            renderHost(game)
+
+          if (payload?.kind === 'status_request' && payload.requestId) {
+            await sendRelayMessage(relay, {
+              kind: 'status',
+              requestId: payload.requestId,
+              stage: game.stage,
+              full: game.players.length >= game.expectedPlayers,
+              currentPlayers: game.players.length,
+              expectedPlayers: game.expectedPlayers
+            })
+            return
+          }
+
+          if (payload?.kind === 'submission' && payload.requestId && payload.submission) {
+            try {
+              const changed = importPlayer(game, payload.submission, { relay: true })
+              await sendRelayMessage(relay, {
+                kind: 'ack',
+                requestId: payload.requestId,
+                ok: true,
+                message: `${payload.submission.name} was accepted.`,
+                currentPlayers: game.players.length,
+                expectedPlayers: game.expectedPlayers,
+                full: game.players.length >= game.expectedPlayers
+              })
+              if (changed) {
+                toast(`${payload.submission.name} submitted`)
+                renderHost(game)
+              }
+            } catch (e) {
+              await sendRelayMessage(relay, {
+                kind: 'ack',
+                requestId: payload.requestId,
+                ok: false,
+                message: e?.message || 'This submission was rejected.',
+                currentPlayers: game.players.length,
+                expectedPlayers: game.expectedPlayers,
+                full: game.players.length >= game.expectedPlayers
+              })
+            }
+            return
+          }
+
+          // Backward compatibility with the immediately previous direct-submit build.
+          if (payload?.g && payload?.name && Array.isArray(payload?.songs)) {
+            const changed = importPlayer(game, payload, { relay: true })
+            if (changed) {
+              toast(`${payload.name} submitted`)
+              renderHost(game)
+            }
           }
         } catch (_) {
           // Ignore unrelated, malformed, or undecryptable traffic on this random topic.
@@ -485,26 +583,26 @@
   }
 
   function importPlayer(game, payload, options = {}) {
+    if (game.stage !== 'lobby') throw new Error('This game is no longer accepting player submissions.')
     if (payload.g !== game.id) throw new Error(`This submission belongs to game ${payload.g}, not ${game.id}.`)
     if (payload.songs.length !== game.songsPerPlayer) throw new Error(`This player must submit exactly ${game.songsPerPlayer} songs.`)
     if (new Set(payload.songs).size !== payload.songs.length) throw new Error('This submission contains a repeated song.')
     if (payload.songs.some(id => !/^[A-Za-z0-9_-]{11}$/.test(id))) throw new Error('One or more YouTube video IDs are invalid.')
-    const duplicateName = game.players.findIndex(p => p.name.toLowerCase() === payload.name.trim().toLowerCase())
-    const player = { name: payload.name.trim().slice(0,40), songs: payload.songs }
+
+    const player = { name: payload.name.trim().replace(/\s+/g, ' ').slice(0,40), songs: payload.songs }
     if (!player.name) throw new Error('Player name is missing.')
+
+    const normalizedName = normalizePlayerName(player.name)
+    const duplicateName = game.players.findIndex(p => normalizePlayerName(p.name) === normalizedName)
     if (duplicateName >= 0) {
-      const sameSongs = JSON.stringify(game.players[duplicateName].songs) === JSON.stringify(player.songs)
-      if (options.relay) {
-        if (sameSongs) return false
-        game.players[duplicateName] = player
-      } else {
-        if (!confirm(`${player.name} already exists. Replace their submission?`)) throw new Error('Import cancelled.')
-        game.players[duplicateName] = player
-      }
-    } else {
-      if (game.players.length >= game.expectedPlayers) throw new Error('All player slots are already filled.')
-      game.players.push(player)
+      throw new Error(`The player name “${player.name}” has already submitted. Repeated players are not allowed.`)
     }
+
+    if (game.players.length >= game.expectedPlayers) {
+      throw new Error(`This game is full. All ${game.expectedPlayers} player submissions have already been received.`)
+    }
+
+    game.players.push(player)
     touchHost(game)
     return true
   }
@@ -552,6 +650,7 @@
           <div class="between"><div class="brand"><span class="note">♫</span> PLAYER SUBMISSION</div><span class="pill">Game ${htmlEscape(gameId)}</span></div>
           <h2 style="margin-top:18px">Choose ${safeN} song${safeN===1?'':'s'}</h2>
           <p>Paste YouTube links. The same player cannot submit the same video twice.${relay?.topic && relay?.key ? ' When you press Submit, your songs go directly to the host.' : ''}</p>
+          ${relay?.topic && relay?.key ? '<div id="roomStatus" class="info-box">Checking whether the room still has space…</div>' : ''}
           <form id="submitForm" class="stack-lg" style="margin-top:20px">
             <label class="label">Your name
               <input class="input" id="playerName" maxlength="40" value="${htmlEscape(draft?.name || '')}" placeholder="e.g. Sarah" required>
@@ -564,7 +663,7 @@
                 </label>`).join('')}
             </div>
             <div id="submitError"></div>
-            <button class="btn block" id="submitBtn">${relay?.topic && relay?.key ? 'Submit songs to host' : 'Create submission code'}</button>
+            <button class="btn block" id="submitBtn" ${relay?.topic && relay?.key ? 'disabled' : ''}>${relay?.topic && relay?.key ? 'Checking room…' : 'Create submission code'}</button>
           </form>
           <button class="btn ghost block" id="homeBtn" style="margin-top:12px">Home</button>
         </section>
@@ -576,6 +675,37 @@
     inputs.forEach(i => i.addEventListener('input', saveDraft))
     nameInput.addEventListener('input', saveDraft)
     document.getElementById('homeBtn').onclick = renderHome
+
+    if (relay?.topic && relay?.key) {
+      const submitBtn = document.getElementById('submitBtn')
+      const statusBox = document.getElementById('roomStatus')
+      requestRoomStatus(relay).then(status => {
+        if (status.stage !== 'lobby') {
+          submitBtn.disabled = true
+          submitBtn.textContent = 'Submissions closed'
+          statusBox.className = 'error-box'
+          statusBox.textContent = 'This game has already started or is no longer accepting submissions.'
+          return
+        }
+        if (status.full) {
+          submitBtn.disabled = true
+          submitBtn.textContent = 'Room full'
+          statusBox.className = 'error-box'
+          statusBox.textContent = `This game is full. ${status.currentPlayers} / ${status.expectedPlayers} players have already submitted.`
+          return
+        }
+        submitBtn.disabled = false
+        submitBtn.textContent = 'Submit songs to host'
+        statusBox.className = 'info-box'
+        statusBox.textContent = `Room open: ${status.currentPlayers} / ${status.expectedPlayers} players received.`
+      }).catch(() => {
+        submitBtn.disabled = false
+        submitBtn.textContent = 'Submit songs to host'
+        statusBox.className = 'info-box'
+        statusBox.textContent = 'Could not confirm room status. You may still try to submit; the host will reject duplicates or a full room.'
+      })
+    }
+
     document.getElementById('submitForm').onsubmit = async (e) => {
       e.preventDefault()
       const err = document.getElementById('submitError')
@@ -592,13 +722,19 @@
         return
       }
       const payload = { v: APP_VERSION, g: gameId, name, songs: ids }
-      localStorage.removeItem(PLAYER_DRAFT_KEY)
       if (relay?.topic && relay?.key) {
         submitBtn.disabled = true
         submitBtn.textContent = 'Sending to host…'
         err.innerHTML = ''
         try {
-          await sendRelaySubmission(relay, payload)
+          const ack = await sendRelaySubmission(relay, payload)
+          if (!ack.ok) {
+            submitBtn.disabled = !!ack.full
+            submitBtn.textContent = ack.full ? 'Room full' : 'Submit songs to host'
+            err.innerHTML = `<div class="error-box">${htmlEscape(ack.message || 'The host rejected this submission.')}</div>`
+            return
+          }
+          localStorage.removeItem(PLAYER_DRAFT_KEY)
           renderPlayerReady(payload, { direct: true, relay })
           return
         } catch (_) {
@@ -606,6 +742,7 @@
           return
         }
       }
+      localStorage.removeItem(PLAYER_DRAFT_KEY)
       renderPlayerReady(payload, { direct: false, relay: null })
     }
   }
@@ -632,7 +769,7 @@
                 <textarea class="textarea" readonly id="codeBox">${htmlEscape(code)}</textarea>
               </div>
             </details>
-            <button class="btn ghost block" id="newBtn">Create another submission</button>
+            <button class="btn ghost block" id="newBtn">Submit for another player on this device</button>
           </div>
         </section>
       </main>`
