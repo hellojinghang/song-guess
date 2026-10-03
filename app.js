@@ -436,7 +436,7 @@
               ${Array.from({length:safeN},(_,i)=>`
                 <label class="song-input-row">
                   <span class="song-number">${i+1}</span>
-                  <input class="input songUrl" inputmode="url" autocomplete="off" value="${htmlEscape(draft?.urls?.[i] || '')}" placeholder="YouTube link" required>
+                  <textarea class="textarea songUrl" inputmode="url" autocomplete="off" placeholder="Paste full YouTube link here" rows="2" required>${htmlEscape(draft?.urls?.[i] || '')}</textarea>
                 </label>`).join('')}
             </div>
             <div id="submitError"></div>
