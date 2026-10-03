@@ -710,19 +710,6 @@
   function renderPlayerSubmission(gameId, songsPerPlayer, relay = null) {
     activeView = 'submit'
     const safeN = Math.max(1, Math.min(10, Number(songsPerPlayer) || 1))
-    const previousSubmission = getPlayerSubmitted(gameId)
-    if (previousSubmission) {
-      app.innerHTML = `
-        <main class="center-page">
-          <section class="card">
-            <div class="brand"><span class="note">♫</span> PLAYER</div>
-            <h2 style="margin-top:18px">Submission already received</h2>
-            <div class="info-box">This device has already submitted for game <strong>${htmlEscape(gameId)}</strong>${previousSubmission.name ? ` as <strong>${htmlEscape(previousSubmission.name)}</strong>` : ''}.</div>
-            <p class="small muted" style="margin-top:14px">To prevent repeated players, this device cannot submit again for the same game. If this was a mistake, ask the host to remove your player and use a different browser/device.</p>
-          </section>
-        </main>`
-      return
-    }
     let draft = null
     try {
       draft = JSON.parse(localStorage.getItem(PLAYER_DRAFT_KEY) || 'null')
@@ -817,7 +804,6 @@
             return
           }
           localStorage.removeItem(PLAYER_DRAFT_KEY)
-          markPlayerSubmitted(gameId, name)
           renderPlayerReady(payload, { direct: true, relay })
           return
         } catch (_) {
@@ -826,7 +812,6 @@
         }
       }
       localStorage.removeItem(PLAYER_DRAFT_KEY)
-      markPlayerSubmitted(gameId, name)
       renderPlayerReady(payload, { direct: false, relay: null })
     }
   }
@@ -853,12 +838,17 @@
                 <textarea class="textarea" readonly id="codeBox">${htmlEscape(code)}</textarea>
               </div>
             </details>
-            <div class="small muted">You can close this page. Player devices do not have access to the host starting page.</div>
+            <button class="btn secondary block" id="anotherPlayerBtn">Submit another player</button>
+            <div class="small muted">This device may submit for multiple different players until the room is full. Player devices do not have access to the host starting page.</div>
           </div>
         </section>
       </main>`
     renderQr('playerQr', code, 240)
     document.getElementById('copyBtn').onclick = async () => { await copyText(code); toast('Submission code copied') }
+    document.getElementById('anotherPlayerBtn').onclick = () => {
+      try { localStorage.removeItem(PLAYER_DRAFT_KEY) } catch (_) {}
+      renderPlayerSubmission(payload.g, payload.songs.length, relay)
+    }
   }
 
   function renderGame(game) {
