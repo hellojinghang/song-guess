@@ -16,6 +16,7 @@
   let ytPlayerReady = false
   let playbackWatcher = null
   let scanner = null
+  let relaySource = null
   let activeView = null
 
   const params = new URLSearchParams(location.search)
@@ -68,6 +69,108 @@
     const binary = atob(padded)
     const bytes = Uint8Array.from(binary, c => c.charCodeAt(0))
     return JSON.parse(new TextDecoder().decode(bytes))
+  }
+
+
+  function bytesToBase64Url(bytes) {
+    let binary = ''
+    bytes.forEach(b => { binary += String.fromCharCode(b) })
+    return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '')
+  }
+
+  function base64UrlToBytes(text) {
+    const normalized = text.replaceAll('-', '+').replaceAll('_', '/')
+    const padded = normalized + '='.repeat((4 - normalized.length % 4) % 4)
+    const binary = atob(padded)
+    return Uint8Array.from(binary, c => c.charCodeAt(0))
+  }
+
+  function randomSecret(byteLength = 24) {
+    const bytes = new Uint8Array(byteLength)
+    crypto.getRandomValues(bytes)
+    return bytesToBase64Url(bytes)
+  }
+
+  function ensureRelay(game) {
+    let changed = false
+    if (!game.relayTopic) { game.relayTopic = `sga_${randomId(36)}`; changed = true }
+    if (!game.relayKey) { game.relayKey = randomSecret(32); changed = true }
+    if (changed) {
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(game)) } catch (_) {}
+    }
+    return { topic: game.relayTopic, key: game.relayKey }
+  }
+
+  async function encryptRelayPayload(keyText, payload) {
+    const keyBytes = base64UrlToBytes(keyText)
+    const key = await crypto.subtle.importKey('raw', keyBytes, 'AES-GCM', false, ['encrypt'])
+    const iv = new Uint8Array(12)
+    crypto.getRandomValues(iv)
+    const plaintext = new TextEncoder().encode(JSON.stringify(payload))
+    const ciphertext = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plaintext))
+    return `SGR1.${bytesToBase64Url(iv)}.${bytesToBase64Url(ciphertext)}`
+  }
+
+  async function decryptRelayPayload(keyText, message) {
+    const parts = String(message || '').split('.')
+    if (parts.length !== 3 || parts[0] !== 'SGR1') throw new Error('Unsupported relay message.')
+    const keyBytes = base64UrlToBytes(keyText)
+    const key = await crypto.subtle.importKey('raw', keyBytes, 'AES-GCM', false, ['decrypt'])
+    const iv = base64UrlToBytes(parts[1])
+    const ciphertext = base64UrlToBytes(parts[2])
+    const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext)
+    return JSON.parse(new TextDecoder().decode(plaintext))
+  }
+
+  async function sendRelaySubmission(relay, payload) {
+    if (!relay?.topic || !relay?.key) throw new Error('Direct submission is unavailable for this invitation.')
+    const encrypted = await encryptRelayPayload(relay.key, payload)
+    const response = await fetch(`https://ntfy.sh/${encodeURIComponent(relay.topic)}`, {
+      method: 'POST',
+      body: encrypted,
+      headers: { 'Cache': 'no', 'Firebase': 'no' }
+    })
+    if (!response.ok) throw new Error(`Relay returned HTTP ${response.status}.`)
+  }
+
+  function stopRelayListener() {
+    try { relaySource?.close?.() } catch (_) {}
+    relaySource = null
+  }
+
+  function setRelayStatus(text, ok = false) {
+    const el = document.getElementById('relayStatus')
+    if (!el) return
+    el.textContent = text
+    el.classList.toggle('ok', ok)
+  }
+
+  function startRelayListener(game) {
+    stopRelayListener()
+    if (game.stage !== 'lobby') return
+    const relay = ensureRelay(game)
+    setRelayStatus('Connecting live submissions…', false)
+    try {
+      relaySource = new EventSource(`https://ntfy.sh/${encodeURIComponent(relay.topic)}/sse`)
+      relaySource.addEventListener('open', () => setRelayStatus('Live submissions connected', true))
+      relaySource.onmessage = async (event) => {
+        try {
+          const envelope = JSON.parse(event.data)
+          if (envelope.event !== 'message' || !envelope.message) return
+          const payload = await decryptRelayPayload(relay.key, envelope.message)
+          const changed = importPlayer(game, payload, { relay: true })
+          if (changed) {
+            toast(`${payload.name} submitted`)
+            renderHost(game)
+          }
+        } catch (_) {
+          // Ignore unrelated, malformed, or undecryptable traffic on this random topic.
+        }
+      }
+      relaySource.onerror = () => setRelayStatus('Live relay reconnecting…', false)
+    } catch (_) {
+      setRelayStatus('Live relay unavailable; offline fallback still works', false)
+    }
   }
 
   function toast(message) {
@@ -153,12 +256,15 @@
   }
 
   function makeInviteUrl(game) {
+    const relay = ensureRelay(game)
     const url = new URL(location.href)
     url.search = ''
     url.hash = ''
     url.searchParams.set('mode', 'submit')
     url.searchParams.set('g', game.id)
     url.searchParams.set('n', String(game.songsPerPlayer))
+    url.searchParams.set('t', relay.topic)
+    url.searchParams.set('k', relay.key)
     return url.toString()
   }
 
@@ -203,13 +309,14 @@
   }
 
   function renderHome() {
+    stopRelayListener()
     activeView = 'home'
     app.innerHTML = `
       <main class="center-page">
         <section class="card">
           <div class="brand"><span class="note">♫</span> SONG GUESS AID</div>
           <h1>Tiny clips.<br>Big guesses.</h1>
-          <p>One free GitHub Pages website. No login for players, no database, and the same interface works on phone, tablet, laptop, or desktop.</p>
+          <p>One free GitHub Pages website. No player login or database. Invitation links support direct live submission from phone, tablet, laptop, or desktop.</p>
           <div class="stack" style="margin-top:26px">
             <button class="btn block" id="hostBtn">Host a game</button>
             <button class="btn secondary block" id="playerBtn">Submit songs</button>
@@ -227,6 +334,7 @@
   }
 
   function renderCreateHost() {
+    stopRelayListener()
     activeView = 'create'
     app.innerHTML = `
       <main class="center-page">
@@ -262,7 +370,9 @@
         questions: [],
         currentIndex: 0,
         selectedDuration: 1,
-        ended: false
+        ended: false,
+        relayTopic: `sga_${randomId(36)}`,
+        relayKey: randomSecret(32)
       }
       touchHost(game)
       renderHost(game)
@@ -294,15 +404,21 @@
                 </div>
               </div>
               <div class="panel stack">
-                <h3 style="margin:0">Import a player</h3>
-                <p class="small">Paste the player's submission code, or scan their QR code using this device's camera.</p>
-                <textarea class="textarea" id="submissionCode" placeholder="Paste SGS1... code here"></textarea>
-                <div class="grid-2">
-                  <button class="btn" id="importBtn">Import code</button>
-                  <button class="btn secondary" id="scanBtn">Scan QR</button>
-                </div>
-                <div id="scannerArea"></div>
-                <div id="importError"></div>
+                <div class="between"><h3 style="margin:0">Live submissions</h3><span class="pill" id="relayStatus">Connecting…</span></div>
+                <p class="small">Players who open your invitation link can now submit directly. Their name and songs will appear here automatically.</p>
+                <div class="info-box">Keep this host lobby open while players submit. The relay message is encrypted in the player's browser and sent without server-side message caching.</div>
+                <details>
+                  <summary class="muted" style="cursor:pointer">Offline fallback: import a submission code</summary>
+                  <div class="stack" style="margin-top:12px">
+                    <textarea class="textarea" id="submissionCode" placeholder="Paste SGS1... code here"></textarea>
+                    <div class="grid-2">
+                      <button class="btn" type="button" id="importBtn">Import code</button>
+                      <button class="btn secondary" type="button" id="scanBtn">Scan QR</button>
+                    </div>
+                    <div id="scannerArea"></div>
+                    <div id="importError"></div>
+                  </div>
+                </details>
               </div>
             </div>
             <div class="stack-lg">
@@ -313,13 +429,13 @@
                     <div class="player-item">
                       <div><div class="player-name">${htmlEscape(p.name)}</div><div class="small muted">${p.songs.length} songs</div></div>
                       <button class="btn ghost removePlayerBtn" data-index="${i}">Remove</button>
-                    </div>`).join('') : `<div class="muted">No player submissions imported yet.</div>`}
+                    </div>`).join('') : `<div class="muted">Waiting for player submissions…</div>`}
                 </div>
               </div>
               <div class="panel stack">
                 <div class="info-box">Different players may submit the same YouTube video. It becomes one question and all matching providers are revealed together.</div>
                 <button class="btn good block" id="startBtn" ${ready?'':'disabled'}>Start game</button>
-                ${!ready ? `<div class="small muted">Import exactly ${game.expectedPlayers} players before starting.</div>` : ''}
+                ${!ready ? `<div class="small muted">Receive exactly ${game.expectedPlayers} players before starting.</div>` : ''}
                 <button class="btn danger block" id="endBtn">Delete this game</button>
               </div>
             </div>
@@ -328,6 +444,7 @@
       </main>`
 
     renderQr('inviteQr', invite, 230)
+    startRelayListener(game)
     document.getElementById('homeBtn').onclick = renderHome
     document.getElementById('copyInviteBtn').onclick = async () => { await copyText(invite); toast('Invite link copied') }
     document.getElementById('importBtn').onclick = () => importSubmissionFromInput(game)
@@ -367,7 +484,7 @@
     }
   }
 
-  function importPlayer(game, payload) {
+  function importPlayer(game, payload, options = {}) {
     if (payload.g !== game.id) throw new Error(`This submission belongs to game ${payload.g}, not ${game.id}.`)
     if (payload.songs.length !== game.songsPerPlayer) throw new Error(`This player must submit exactly ${game.songsPerPlayer} songs.`)
     if (new Set(payload.songs).size !== payload.songs.length) throw new Error('This submission contains a repeated song.')
@@ -376,13 +493,20 @@
     const player = { name: payload.name.trim().slice(0,40), songs: payload.songs }
     if (!player.name) throw new Error('Player name is missing.')
     if (duplicateName >= 0) {
-      if (!confirm(`${player.name} already exists. Replace their submission?`)) throw new Error('Import cancelled.')
-      game.players[duplicateName] = player
+      const sameSongs = JSON.stringify(game.players[duplicateName].songs) === JSON.stringify(player.songs)
+      if (options.relay) {
+        if (sameSongs) return false
+        game.players[duplicateName] = player
+      } else {
+        if (!confirm(`${player.name} already exists. Replace their submission?`)) throw new Error('Import cancelled.')
+        game.players[duplicateName] = player
+      }
     } else {
       if (game.players.length >= game.expectedPlayers) throw new Error('All player slots are already filled.')
       game.players.push(player)
     }
     touchHost(game)
+    return true
   }
 
   function renderManualJoin() {
@@ -414,7 +538,7 @@
     }
   }
 
-  function renderPlayerSubmission(gameId, songsPerPlayer) {
+  function renderPlayerSubmission(gameId, songsPerPlayer, relay = null) {
     activeView = 'submit'
     const safeN = Math.max(1, Math.min(10, Number(songsPerPlayer) || 1))
     let draft = null
@@ -427,7 +551,7 @@
         <section class="card">
           <div class="between"><div class="brand"><span class="note">♫</span> PLAYER SUBMISSION</div><span class="pill">Game ${htmlEscape(gameId)}</span></div>
           <h2 style="margin-top:18px">Choose ${safeN} song${safeN===1?'':'s'}</h2>
-          <p>Paste YouTube links. The same player cannot submit the same video twice.</p>
+          <p>Paste YouTube links. The same player cannot submit the same video twice.${relay?.topic && relay?.key ? ' When you press Submit, your songs go directly to the host.' : ''}</p>
           <form id="submitForm" class="stack-lg" style="margin-top:20px">
             <label class="label">Your name
               <input class="input" id="playerName" maxlength="40" value="${htmlEscape(draft?.name || '')}" placeholder="e.g. Sarah" required>
@@ -440,7 +564,7 @@
                 </label>`).join('')}
             </div>
             <div id="submitError"></div>
-            <button class="btn block">Create my submission</button>
+            <button class="btn block" id="submitBtn">${relay?.topic && relay?.key ? 'Submit songs to host' : 'Create submission code'}</button>
           </form>
           <button class="btn ghost block" id="homeBtn" style="margin-top:12px">Home</button>
         </section>
@@ -452,9 +576,10 @@
     inputs.forEach(i => i.addEventListener('input', saveDraft))
     nameInput.addEventListener('input', saveDraft)
     document.getElementById('homeBtn').onclick = renderHome
-    document.getElementById('submitForm').onsubmit = (e) => {
+    document.getElementById('submitForm').onsubmit = async (e) => {
       e.preventDefault()
       const err = document.getElementById('submitError')
+      const submitBtn = document.getElementById('submitBtn')
       const name = nameInput.value.trim()
       const ids = inputs.map(x => extractYouTubeId(x.value))
       if (!name) return
@@ -466,37 +591,58 @@
         err.innerHTML = '<div class="error-box">You submitted the same YouTube video more than once. Replace the duplicate.</div>'
         return
       }
+      const payload = { v: APP_VERSION, g: gameId, name, songs: ids }
       localStorage.removeItem(PLAYER_DRAFT_KEY)
-      renderPlayerReady({ v: APP_VERSION, g: gameId, name, songs: ids })
+      if (relay?.topic && relay?.key) {
+        submitBtn.disabled = true
+        submitBtn.textContent = 'Sending to host…'
+        err.innerHTML = ''
+        try {
+          await sendRelaySubmission(relay, payload)
+          renderPlayerReady(payload, { direct: true, relay })
+          return
+        } catch (_) {
+          renderPlayerReady(payload, { direct: false, relay, failed: true })
+          return
+        }
+      }
+      renderPlayerReady(payload, { direct: false, relay: null })
     }
   }
 
-  function renderPlayerReady(payload) {
+  function renderPlayerReady(payload, options = {}) {
     activeView = 'playerReady'
     const code = makeSubmissionCode(payload)
+    const direct = !!options.direct
+    const relay = options.relay || null
+    const failed = !!options.failed
     app.innerHTML = `
       <main class="center-page">
         <section class="card">
-          <div class="brand"><span class="note">♫</span> READY</div>
-          <h2 style="margin-top:18px">Give this to the host</h2>
-          <p>Your song choices are encoded locally. Nothing was uploaded to a database.</p>
+          <div class="brand"><span class="note">♫</span> ${direct ? 'SUBMITTED' : 'READY'}</div>
+          <h2 style="margin-top:18px">${direct ? 'Songs sent to the host ✓' : failed ? 'Direct send did not connect' : 'Give this to the host'}</h2>
+          <p>${direct ? 'Your submission was sent through the live relay. Ask the host to confirm your name appears in the lobby.' : failed ? 'No songs were lost. Use the fallback below so the host can import your submission.' : 'Use the fallback code or QR so the host can import your songs.'}</p>
           <div class="stack-lg" style="margin-top:22px">
-            <div id="playerQr" class="qr-wrap"></div>
-            <button class="btn block" id="copyBtn">Copy submission code</button>
-            <details>
-              <summary class="muted" style="cursor:pointer">Show code for manual copy</summary>
-              <textarea class="textarea" readonly id="codeBox" style="margin-top:10px">${htmlEscape(code)}</textarea>
+            ${direct ? `<div class="info-box">You are finished. You can close this page. The fallback below is only needed if the host says your name did not appear.</div>` : ''}
+            <details ${direct ? '' : 'open'}>
+              <summary class="muted" style="cursor:pointer">${direct ? 'Offline fallback' : 'Submission fallback'}</summary>
+              <div class="stack" style="margin-top:12px">
+                <div id="playerQr" class="qr-wrap"></div>
+                <button class="btn ${direct ? 'secondary' : ''} block" id="copyBtn">Copy submission code</button>
+                <textarea class="textarea" readonly id="codeBox">${htmlEscape(code)}</textarea>
+              </div>
             </details>
-            <button class="btn secondary block" id="newBtn">Create another submission</button>
+            <button class="btn ghost block" id="newBtn">Create another submission</button>
           </div>
         </section>
       </main>`
     renderQr('playerQr', code, 240)
     document.getElementById('copyBtn').onclick = async () => { await copyText(code); toast('Submission code copied') }
-    document.getElementById('newBtn').onclick = () => renderPlayerSubmission(payload.g, payload.songs.length)
+    document.getElementById('newBtn').onclick = () => renderPlayerSubmission(payload.g, payload.songs.length, relay)
   }
 
   function renderGame(game) {
+    stopRelayListener()
     activeView = 'game'
     stopScanner()
     stopPlaybackWatcher()
@@ -666,6 +812,7 @@
   }
 
   function renderEnd(game) {
+    stopRelayListener()
     activeView = 'ended'
     destroyPlayer()
     app.innerHTML = `
@@ -797,7 +944,10 @@
     if (mode === 'submit') {
       const g = (params.get('g') || '').trim().toUpperCase()
       const n = Number(params.get('n'))
-      if (/^[A-Z2-9]{6}$/.test(g) && n >= 1 && n <= 10) return renderPlayerSubmission(g, n)
+      const t = (params.get('t') || '').trim()
+      const k = (params.get('k') || '').trim()
+      const relay = /^[A-Za-z0-9_-]{8,64}$/.test(t) && /^[A-Za-z0-9_-]{32,64}$/.test(k) ? { topic: t, key: k } : null
+      if (/^[A-Z2-9]{6}$/.test(g) && n >= 1 && n <= 10) return renderPlayerSubmission(g, n, relay)
       return renderManualJoin()
     }
     renderHome()
