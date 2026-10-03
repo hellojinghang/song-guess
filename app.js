@@ -5,6 +5,8 @@
   const APP_VERSION = 1
   const STORAGE_KEY = 'songGuessAid.hostGame.v1'
   const PLAYER_DRAFT_KEY = 'songGuessAid.playerDraft.v1'
+  const PLAYER_SUBMITTED_PREFIX = 'songGuessAid.playerSubmitted.v1.'
+  const HOST_UNLOCK_KEY = 'songGuessAid.hostUnlocked.v1'
   const EXPIRY_MS = 60 * 60 * 1000
   const channel = 'BroadcastChannel' in window ? new BroadcastChannel('song-guess-aid') : null
 
@@ -89,10 +91,38 @@
     return Uint8Array.from(binary, c => c.charCodeAt(0))
   }
 
+  function randomHostPin() {
+    const bytes = new Uint32Array(1)
+    crypto.getRandomValues(bytes)
+    return String(100000 + (bytes[0] % 900000))
+  }
+
   function randomSecret(byteLength = 24) {
     const bytes = new Uint8Array(byteLength)
     crypto.getRandomValues(bytes)
     return bytesToBase64Url(bytes)
+  }
+
+  function playerSubmittedKey(gameId) { return `${PLAYER_SUBMITTED_PREFIX}${gameId}` }
+
+  function markPlayerSubmitted(gameId, name) {
+    try { localStorage.setItem(playerSubmittedKey(gameId), JSON.stringify({ name, at: now() })) } catch (_) {}
+  }
+
+  function getPlayerSubmitted(gameId) {
+    try { return JSON.parse(localStorage.getItem(playerSubmittedKey(gameId)) || 'null') } catch (_) { return null }
+  }
+
+  function isHostUnlocked(game) {
+    try { return sessionStorage.getItem(HOST_UNLOCK_KEY) === game?.id } catch (_) { return false }
+  }
+
+  function unlockHost(game) {
+    try { sessionStorage.setItem(HOST_UNLOCK_KEY, game.id) } catch (_) {}
+  }
+
+  function lockHost() {
+    try { sessionStorage.removeItem(HOST_UNLOCK_KEY) } catch (_) {}
   }
 
   function ensureRelay(game) {
@@ -314,7 +344,13 @@
       if (!game) return null
       if (!game.lastActivity || now() - game.lastActivity > EXPIRY_MS) {
         localStorage.removeItem(STORAGE_KEY)
+        lockHost()
         return null
+      }
+      if (!game.hostPin) {
+        game.hostPin = randomHostPin()
+        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(game)) } catch (_) {}
+        unlockHost(game)
       }
       return game
     } catch (_) {
@@ -325,6 +361,7 @@
 
   function clearHostGame() {
     localStorage.removeItem(STORAGE_KEY)
+    lockHost()
     broadcastGame(null)
   }
 
@@ -413,22 +450,50 @@
       <main class="center-page">
         <section class="card">
           <div class="brand"><span class="note">♫</span> SONG GUESS AID</div>
-          <h1>Tiny clips.<br>Big guesses.</h1>
-          <p>One free GitHub Pages website. No player login or database. Invitation links support direct live submission from phone, tablet, laptop, or desktop.</p>
+          <h1>Host control.</h1>
+          <p>This starting page is for the host. Players should enter only through the invitation link or QR code generated for the current game.</p>
           <div class="stack" style="margin-top:26px">
             <button class="btn block" id="hostBtn">Host a game</button>
-            <button class="btn secondary block" id="playerBtn">Submit songs</button>
           </div>
           <div class="divider" style="margin:22px 0"></div>
-          <p class="small">For the cleanest guessing screen, the host can open an Audience Display tab/window on the same computer and put that window on the TV or projector.</p>
+          <p class="small">Players do not need this page and are not given a Home button. For the cleanest guessing screen, open Audience Display on the host computer and move it to the TV or projector.</p>
         </section>
       </main>`
     document.getElementById('hostBtn').onclick = () => {
       const existing = loadHostGame()
-      if (existing) renderHost(existing)
-      else renderCreateHost()
+      if (!existing) return renderCreateHost()
+      if (isHostUnlocked(existing)) return renderHost(existing)
+      renderHostPinGate(existing)
     }
-    document.getElementById('playerBtn').onclick = () => renderManualJoin()
+  }
+
+  function renderHostPinGate(game) {
+    activeView = 'hostGate'
+    app.innerHTML = `
+      <main class="center-page">
+        <section class="card">
+          <div class="brand"><span class="note">♫</span> HOST ACCESS</div>
+          <h2 style="margin-top:18px">Unlock current game</h2>
+          <p>Enter the 6-digit Host PIN created with game <strong>${htmlEscape(game.id)}</strong>.</p>
+          <form id="hostPinForm" class="stack-lg" style="margin-top:20px">
+            <label class="label">Host PIN
+              <input class="input" id="hostPinInput" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="off" placeholder="6 digits" required>
+            </label>
+            <div id="hostPinError"></div>
+            <button class="btn block">Unlock host controls</button>
+          </form>
+        </section>
+      </main>`
+    document.getElementById('hostPinForm').onsubmit = (e) => {
+      e.preventDefault()
+      const value = document.getElementById('hostPinInput').value.trim()
+      if (value !== String(game.hostPin || '')) {
+        document.getElementById('hostPinError').innerHTML = '<div class="error-box">Incorrect Host PIN.</div>'
+        return
+      }
+      unlockHost(game)
+      renderHost(game)
+    }
   }
 
   function renderCreateHost() {
@@ -470,8 +535,10 @@
         selectedDuration: 1,
         ended: false,
         relayTopic: `sga_${randomId(36)}`,
-        relayKey: randomSecret(32)
+        relayKey: randomSecret(32),
+        hostPin: randomHostPin()
       }
+      unlockHost(game)
       touchHost(game)
       renderHost(game)
     }
@@ -489,7 +556,7 @@
         <section class="card wide">
           <div class="between">
             <div><div class="brand"><span class="note">♫</span> HOST LOBBY</div><div class="code-display" style="margin-top:12px">${htmlEscape(game.id)}</div></div>
-            <button class="btn ghost" id="homeBtn">Home</button>
+            <button class="btn ghost" id="homeBtn">Lock & Home</button>
           </div>
           <div class="grid-2" style="margin-top:24px;align-items:start">
             <div class="stack-lg">
@@ -531,6 +598,10 @@
                 </div>
               </div>
               <div class="panel stack">
+                <details>
+                  <summary class="muted" style="cursor:pointer">Host security</summary>
+                  <div class="info-box" style="margin-top:12px">Host PIN: <strong style="letter-spacing:.16em">${htmlEscape(game.hostPin)}</strong>. Keep this private. It is required after you lock the host controls.</div>
+                </details>
                 <div class="info-box">Different players may submit the same YouTube video. It becomes one question and all matching providers are revealed together.</div>
                 <button class="btn good block" id="startBtn" ${ready?'':'disabled'}>Start game</button>
                 ${!ready ? `<div class="small muted">Receive exactly ${game.expectedPlayers} players before starting.</div>` : ''}
@@ -543,7 +614,7 @@
 
     renderQr('inviteQr', invite, 230)
     startRelayListener(game)
-    document.getElementById('homeBtn').onclick = renderHome
+    document.getElementById('homeBtn').onclick = () => { lockHost(); renderHome() }
     document.getElementById('copyInviteBtn').onclick = async () => { await copyText(invite); toast('Invite link copied') }
     document.getElementById('importBtn').onclick = () => importSubmissionFromInput(game)
     document.getElementById('scanBtn').onclick = () => startScanner(game)
@@ -639,6 +710,19 @@
   function renderPlayerSubmission(gameId, songsPerPlayer, relay = null) {
     activeView = 'submit'
     const safeN = Math.max(1, Math.min(10, Number(songsPerPlayer) || 1))
+    const previousSubmission = getPlayerSubmitted(gameId)
+    if (previousSubmission) {
+      app.innerHTML = `
+        <main class="center-page">
+          <section class="card">
+            <div class="brand"><span class="note">♫</span> PLAYER</div>
+            <h2 style="margin-top:18px">Submission already received</h2>
+            <div class="info-box">This device has already submitted for game <strong>${htmlEscape(gameId)}</strong>${previousSubmission.name ? ` as <strong>${htmlEscape(previousSubmission.name)}</strong>` : ''}.</div>
+            <p class="small muted" style="margin-top:14px">To prevent repeated players, this device cannot submit again for the same game. If this was a mistake, ask the host to remove your player and use a different browser/device.</p>
+          </section>
+        </main>`
+      return
+    }
     let draft = null
     try {
       draft = JSON.parse(localStorage.getItem(PLAYER_DRAFT_KEY) || 'null')
@@ -665,7 +749,6 @@
             <div id="submitError"></div>
             <button class="btn block" id="submitBtn" ${relay?.topic && relay?.key ? 'disabled' : ''}>${relay?.topic && relay?.key ? 'Checking room…' : 'Create submission code'}</button>
           </form>
-          <button class="btn ghost block" id="homeBtn" style="margin-top:12px">Home</button>
         </section>
       </main>`
 
@@ -674,7 +757,6 @@
     const saveDraft = () => localStorage.setItem(PLAYER_DRAFT_KEY, JSON.stringify({g:gameId,n:safeN,name:nameInput.value,urls:inputs.map(x=>x.value)}))
     inputs.forEach(i => i.addEventListener('input', saveDraft))
     nameInput.addEventListener('input', saveDraft)
-    document.getElementById('homeBtn').onclick = renderHome
 
     if (relay?.topic && relay?.key) {
       const submitBtn = document.getElementById('submitBtn')
@@ -735,6 +817,7 @@
             return
           }
           localStorage.removeItem(PLAYER_DRAFT_KEY)
+          markPlayerSubmitted(gameId, name)
           renderPlayerReady(payload, { direct: true, relay })
           return
         } catch (_) {
@@ -743,6 +826,7 @@
         }
       }
       localStorage.removeItem(PLAYER_DRAFT_KEY)
+      markPlayerSubmitted(gameId, name)
       renderPlayerReady(payload, { direct: false, relay: null })
     }
   }
@@ -769,13 +853,12 @@
                 <textarea class="textarea" readonly id="codeBox">${htmlEscape(code)}</textarea>
               </div>
             </details>
-            <button class="btn ghost block" id="newBtn">Submit for another player on this device</button>
+            <div class="small muted">You can close this page. Player devices do not have access to the host starting page.</div>
           </div>
         </section>
       </main>`
     renderQr('playerQr', code, 240)
     document.getElementById('copyBtn').onclick = async () => { await copyText(code); toast('Submission code copied') }
-    document.getElementById('newBtn').onclick = () => renderPlayerSubmission(payload.g, payload.songs.length, relay)
   }
 
   function renderGame(game) {
@@ -1011,7 +1094,6 @@
     const revealVideo = state.revealed && state.videoId ? `<iframe class="reveal-video" src="https://www.youtube.com/embed/${encodeURIComponent(state.videoId)}?rel=0" title="Revealed YouTube song" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>` : ''
     app.innerHTML = `
       <main class="display-page">
-        <button class="btn ghost display-close" id="exitDisplayBtn">Exit display</button>
         <section class="display-inner">
           <div class="display-round">ROUND ${state.round} / ${state.total}</div>
           <div class="display-title">${state.revealed ? 'ANSWER' : 'GUESS THE SONG'}</div>
@@ -1019,7 +1101,6 @@
           ${state.revealed ? `<div class="display-providers">${providerText}</div>${revealVideo}` : ''}
         </section>
       </main>`
-    document.getElementById('exitDisplayBtn').onclick = () => { location.href = location.pathname }
   }
 
   function renderQr(targetId, text, size) {
@@ -1085,7 +1166,8 @@
       const k = (params.get('k') || '').trim()
       const relay = /^[A-Za-z0-9_-]{8,64}$/.test(t) && /^[A-Za-z0-9_-]{32,64}$/.test(k) ? { topic: t, key: k } : null
       if (/^[A-Z2-9]{6}$/.test(g) && n >= 1 && n <= 10) return renderPlayerSubmission(g, n, relay)
-      return renderManualJoin()
+      app.innerHTML = '<main class="center-page"><section class="card"><div class="brand"><span class="note">♫</span> PLAYER</div><h2 style="margin-top:18px">Invalid invitation</h2><p>Please ask the host for a fresh invitation link or QR code.</p></section></main>'
+      return
     }
     renderHome()
 
